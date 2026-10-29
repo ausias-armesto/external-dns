@@ -131,6 +131,22 @@ tests:
               resources: ["ingressroutes", "ingressroutetcps", "ingressrouteudps"]
               verbs: ["get","watch","list"]
 
+  - it: should create RBAC rules for 'dnsrecords' when registry is 'crd'
+    set:
+      sources: []
+      registry: crd
+    asserts:
+      - template: clusterrole.yaml
+        equal:
+          path: rules
+          value:
+            - apiGroups: ["externaldns.k8s.io"]
+              resources: ["dnsrecords"]
+              verbs: ["get","watch","list","create","update","delete"]
+            - apiGroups: ["externaldns.k8s.io"]
+              resources: ["dnsrecords/status"]
+              verbs: ["update"]
+
   - it: should create default RBAC rules for 'f5' when 'f5-virtualserver' is set
     set:
       sources:
@@ -632,4 +648,108 @@ tests:
         documentSelector:
           path: metadata.name
           value: rbac-external-dns-gateway
+        template: clusterrole.yaml
+
+  - it: should not grant events creation by default
+    asserts:
+      - notContains:
+          path: rules
+          content:
+            apiGroups: ["events.k8s.io"]
+            resources: ["events"]
+            verbs: ["create"]
+        template: clusterrole.yaml
+
+  - it: should not grant events creation when only 'triggerLoopOnEvent' is set
+    set:
+      triggerLoopOnEvent: true
+    asserts:
+      - notContains:
+          path: rules
+          content:
+            apiGroups: ["events.k8s.io"]
+            resources: ["events"]
+            verbs: ["create"]
+        template: clusterrole.yaml
+
+  - it: should grant events creation in a ClusterRole when 'eventsEmit' is set
+    set:
+      sources:
+        - service
+      eventsEmit:
+        - RecordReady
+    asserts:
+      - isKind:
+          of: ClusterRole
+        template: clusterrole.yaml
+      - equal:
+          path: rules
+          value:
+            - apiGroups: [""]
+              resources: ["nodes"]
+              verbs: ["list", "watch"]
+            - apiGroups: [""]
+              resources: ["pods"]
+              verbs: ["get", "watch", "list"]
+            - apiGroups: [""]
+              resources: ["services"]
+              verbs: ["get","watch","list"]
+            - apiGroups: ["discovery.k8s.io"]
+              resources: ["endpointslices"]
+              verbs: ["get","watch","list"]
+            - apiGroups: ["events.k8s.io"]
+              resources: ["events"]
+              verbs: ["create"]
+        template: clusterrole.yaml
+
+  - it: should grant events creation in a Role when namespaced is true and 'eventsEmit' is set
+    set:
+      namespaced: true
+      sources:
+        - service
+      eventsEmit:
+        - RecordReady
+    asserts:
+      - isKind:
+          of: Role
+        template: clusterrole.yaml
+      - contains:
+          path: rules
+          content:
+            apiGroups: ["events.k8s.io"]
+            resources: ["events"]
+            verbs: ["create"]
+        template: clusterrole.yaml
+
+  - it: should keep 'rbac.additionalPermissions' after the events rule
+    set:
+      sources: []
+      eventsEmit:
+        - RecordReady
+      rbac:
+        additionalPermissions:
+          - apiGroups: [""]
+            resources: ["configmaps"]
+            verbs: ["get"]
+    asserts:
+      - equal:
+          path: rules
+          value:
+            - apiGroups: ["events.k8s.io"]
+              resources: ["events"]
+              verbs: ["create"]
+            - apiGroups: [""]
+              resources: ["configmaps"]
+              verbs: ["get"]
+        template: clusterrole.yaml
+
+  - it: should not render RBAC when 'rbac.create' is false even if 'eventsEmit' is set
+    set:
+      rbac:
+        create: false
+      eventsEmit:
+        - RecordReady
+    asserts:
+      - hasDocuments:
+          count: 0
         template: clusterrole.yaml

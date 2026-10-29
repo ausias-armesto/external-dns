@@ -19,7 +19,9 @@ package source
 import (
 	"context"
 	"fmt"
+	"maps"
 	"strings"
+	"unicode"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -46,13 +48,14 @@ import (
 // +externaldns:source:description=Creates DNS entries from unstructured Kubernetes resources
 // +externaldns:source:resources=Unstructured
 // +externaldns:source:filters=annotation,label
-// +externaldns:source:namespace=all,single
+// +externaldns:source:namespace=all,single,multiple
 // +externaldns:source:fqdn-template=true
+// +externaldns:source:events=true
 // +externaldns:source:provider-specific=false
-// +externaldns:source:events=false
+// +externaldns:source:validation=annotation
 type unstructuredSource struct {
 	templateEngine template.Engine
-	informers      []kubeinformers.GenericInformer
+	informers      []*informers.Informers[kubeinformers.GenericInformer]
 }
 
 // NewUnstructuredFQDNSource creates a new unstructuredSource.
@@ -67,36 +70,36 @@ func NewUnstructuredFQDNSource(
 		return nil, err
 	}
 
-	// Create a single informer factory for all resources
-	informerFactory := dynamicinformer.NewFilteredDynamicSharedInformerFactory(
-		dynamicClient,
-		0,
-		cfg.Namespace,
-		nil,
-	)
+	// Create one informer factory per watched namespace, shared by all resources
+	factories := informers.NewFactories(cfg.Namespaces, func(namespace string) dynamicinformer.DynamicSharedInformerFactory {
+		return dynamicinformer.NewFilteredDynamicSharedInformerFactory(dynamicClient, 0, namespace, nil)
+	})
 
 	// Create informers for each resource
-	resourceInformers := make([]kubeinformers.GenericInformer, 0, len(gvrs))
+	resourceInformers := make([]*informers.Informers[kubeinformers.GenericInformer], 0, len(gvrs))
 	for _, gvr := range gvrs {
-		informer := informerFactory.ForResource(gvr)
+		resourceInformer := informers.Map(factories, func(_ string, factory dynamicinformer.DynamicSharedInformerFactory) kubeinformers.GenericInformer {
+			return factory.ForResource(gvr)
+		})
 
 		// Add indexers for efficient lookups by namespace and labels (must be before AddEventHandler)
-		informers.MustAddIndexers(informer.Informer(), informers.IndexerWithOptions[*unstructured.Unstructured](
+		resourceInformer.MustAddIndexers(informers.IndexerWithOptions[*unstructured.Unstructured](
 			informers.IndexSelectorWithAnnotationFilter(cfg.AnnotationFilter),
 			informers.IndexSelectorWithLabelSelector(cfg.LabelFilter),
+			informers.IndexSelectorWithAnnotationValidation(cfg.Schema.WithSource(types.Unstructured)),
 			informers.IndexSelectorWithConditions(annotations.IsControllerMatch[*unstructured.Unstructured]),
 		))
-		informers.MustSetTransform(informer.Informer(), informers.TransformerWithOptions[*unstructured.Unstructured](
+		resourceInformer.MustSetTransform(informers.TransformerWithOptions[*unstructured.Unstructured](
 			informers.TransformRemoveManagedFields(),
 			informers.TransformRemoveLastAppliedConfig(),
 		))
 
-		informers.MustAddEventHandler(informer.Informer(), informers.DefaultEventHandler())
-		resourceInformers = append(resourceInformers, informer)
+		resourceInformer.MustAddEventHandler(informers.DefaultEventHandler())
+		resourceInformers = append(resourceInformers, resourceInformer)
 	}
 
-	informerFactory.Start(ctx.Done())
-	if err := informers.WaitForDynamicCacheSync(ctx, informerFactory); err != nil {
+	factories.Start(ctx.Done())
+	if err := informers.WaitForDynamicCacheSyncAll(ctx, factories); err != nil {
 		return nil, err
 	}
 
@@ -110,12 +113,14 @@ func NewUnstructuredFQDNSource(
 func (us *unstructuredSource) Endpoints(_ context.Context) ([]*endpoint.Endpoint, error) {
 	var endpoints []*endpoint.Endpoint
 
-	for _, informer := range us.informers {
-		resourceEndpoints, err := us.endpointsFromInformer(informer)
-		if err != nil {
-			return nil, err
+	for _, resourceInformer := range us.informers {
+		for _, informer := range resourceInformer.All() {
+			resourceEndpoints, err := us.endpointsFromInformer(informer)
+			if err != nil {
+				return nil, err
+			}
+			endpoints = append(endpoints, resourceEndpoints...)
 		}
-		endpoints = append(endpoints, resourceEndpoints...)
 	}
 
 	return endpoints, nil
@@ -123,19 +128,10 @@ func (us *unstructuredSource) Endpoints(_ context.Context) ([]*endpoint.Endpoint
 
 // endpointsFromInformer returns endpoints for a single resource type.
 func (us *unstructuredSource) endpointsFromInformer(informer kubeinformers.GenericInformer) ([]*endpoint.Endpoint, error) {
-	var endpoints []*endpoint.Endpoint
-
 	// Get objects that match the indexer filter (annotation and label selectors)
-	indexKeys := informer.Informer().GetIndexer().ListIndexFuncValues(informers.IndexWithSelectors)
-	if len(indexKeys) == 0 {
-		return nil, nil
-	}
-	for _, key := range indexKeys {
-		obj, err := informers.GetByKey[*unstructured.Unstructured](informer.Informer().GetIndexer(), key)
-		if err != nil {
-			continue
-		}
-
+	objs := informers.ListIndexed[*unstructured.Unstructured](informer.Informer().GetIndexer())
+	endpoints := make([]*endpoint.Endpoint, 0, len(objs))
+	for _, obj := range objs {
 		el := newUnstructuredWrapper(obj)
 
 		hosts := annotations.HostnamesFromAnnotations(el.GetAnnotations())
@@ -165,8 +161,8 @@ func (us *unstructuredSource) endpointsFromInformer(informer kubeinformers.Gener
 
 // AddEventHandler adds an event handler that is called when resources change.
 func (us *unstructuredSource) AddEventHandler(_ context.Context, handler func()) {
-	for _, informer := range us.informers {
-		informers.MustAddEventHandler(informer.Informer(), eventHandlerFunc(handler))
+	for _, resourceInformer := range us.informers {
+		resourceInformer.MustAddEventHandler(eventHandlerFunc(handler))
 	}
 }
 
@@ -213,13 +209,76 @@ func newUnstructuredWrapper(u *unstructured.Unstructured) *unstructuredWrapper {
 		w.Metadata = metadata
 	}
 	if spec, ok := u.Object["spec"].(map[string]any); ok {
-		w.Spec = spec
+		w.Spec = withTitleCaseAliases(spec)
 	}
 	if status, ok := u.Object["status"].(map[string]any); ok {
-		w.Status = status
+		w.Status = withTitleCaseAliases(status)
 	}
 
 	return w
+}
+
+// withTitleCaseAliases lets a template address a JSON-keyed map field
+// (spec.hostnames) by its Go field name too (Spec.Hostnames), since a map
+// key miss in text/template renders empty instead of erroring.
+//
+// Deliberately shallow: an earlier version recursed into nested map values
+// to alias their keys too, but that duplicated every key one level down, so
+// a template ranging or taking len() over nested data (spec.records) saw
+// twice as many entries as were actually declared. Nested JSON keys stay
+// reachable through their literal path (spec.endpoint.hostname) instead.
+func withTitleCaseAliases(m map[string]any) map[string]any {
+	out := make(map[string]any, len(m))
+	maps.Copy(out, m)
+	for k := range m {
+		title := titleCaseKey(k)
+		if title == k {
+			continue
+		}
+		if _, collision := m[title]; collision {
+			continue
+		}
+		out[title] = out[k]
+	}
+	return out
+}
+
+// commonInitialisms are the field-name segments Kubernetes' code generator
+// spells fully upper-case in Go structs (DNSNames, not DnsNames; URL, not
+// Url), taken from the CRD/API-machinery-relevant subset of the initialisms
+// staticcheck/golint treat as standard Go convention.
+var commonInitialisms = map[string]bool{
+	"acl": true, "api": true, "arn": true, "ca": true, "cidr": true,
+	"cpu": true, "crd": true, "db": true, "dns": true, "http": true,
+	"https": true, "id": true, "ip": true, "json": true, "jwk": true,
+	"jwt": true, "os": true, "pem": true, "rbac": true, "sql": true,
+	"ssl": true, "tcp": true, "tls": true, "ttl": true, "udp": true,
+	"uid": true, "uuid": true, "uri": true, "url": true, "vm": true,
+	"xml": true, "yaml": true,
+}
+
+// titleCaseKey converts a lowerCamelCase JSON key into its Go-convention
+// exported field name: dnsNames -> DNSNames, url -> URL, hostname ->
+// Hostname. It upper-cases the leading word in full when that word is a
+// known initialism, matching how Kubernetes generates Go types from CRD
+// schemas; otherwise it capitalizes just the first letter, as before.
+func titleCaseKey(k string) string {
+	if k == "" {
+		return k
+	}
+	r := []rune(k)
+	if unicode.IsUpper(r[0]) {
+		return k
+	}
+	end := 0
+	for end < len(r) && !unicode.IsUpper(r[end]) {
+		end++
+	}
+	word := string(r[:end])
+	if commonInitialisms[strings.ToLower(word)] {
+		return strings.ToUpper(word) + string(r[end:])
+	}
+	return strings.ToUpper(word[:1]) + word[1:] + string(r[end:])
 }
 
 // discoverResources parses and validates resource identifiers against the cluster.

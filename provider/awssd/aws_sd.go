@@ -22,7 +22,9 @@ import (
 	"encoding/hex"
 	"fmt"
 	"regexp"
+	"slices"
 	"strings"
+	"sync"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	sd "github.com/aws/aws-sdk-go-v2/service/servicediscovery"
@@ -30,6 +32,7 @@ import (
 	log "github.com/sirupsen/logrus"
 
 	"sigs.k8s.io/external-dns/endpoint"
+	"sigs.k8s.io/external-dns/internal/idna"
 	"sigs.k8s.io/external-dns/internal/sets"
 	"sigs.k8s.io/external-dns/pkg/apis/externaldns"
 	"sigs.k8s.io/external-dns/plan"
@@ -88,6 +91,10 @@ type AWSSDProvider struct {
 	ownerID string
 	// tags to be added to the service
 	tags []sdtypes.Tag
+
+	mu sync.RWMutex
+	// observedRecordTypes caches Cloud Map record types for drift warnings.
+	observedRecordTypes map[string][]sdtypes.RecordType
 }
 
 // New creates an AWS Service Discovery provider from the given configuration.
@@ -157,6 +164,7 @@ func (p *AWSSDProvider) Records(ctx context.Context) ([]*endpoint.Endpoint, erro
 	}
 
 	endpoints := make([]*endpoint.Endpoint, 0)
+	observed := make(map[string][]sdtypes.RecordType)
 
 	for _, ns := range namespaces {
 		services, err := p.ListServicesByNamespaceID(ctx, ns.Id)
@@ -185,9 +193,15 @@ func (p *AWSSDProvider) Records(ctx context.Context) ([]*endpoint.Endpoint, erro
 				continue
 			}
 
-			endpoints = append(endpoints, p.instancesToEndpoint(ns, srv, resp.Instances))
+			ep := p.instancesToEndpoint(ns, srv, resp.Instances)
+			endpoints = append(endpoints, ep)
+			observed[idna.NormalizeDNSName(ep.DNSName)] = sets.Sorted(sets.New(recordTypes(srv.DnsConfig.DnsRecords)...))
 		}
 	}
+
+	p.mu.Lock()
+	p.observedRecordTypes = observed
+	p.mu.Unlock()
 
 	return endpoints, nil
 }
@@ -231,6 +245,40 @@ func (p *AWSSDProvider) instancesToEndpoint(ns *sdtypes.NamespaceSummary, srv *s
 	}
 
 	return newEndpoint
+}
+
+// AdjustEndpoints converts alias=true into transient dual-stack intent.
+// The alias property is removed because AWS-SD Records() does not restore it.
+// It also warns when the desired record types differ from an existing service.
+func (p *AWSSDProvider) AdjustEndpoints(endpoints []*endpoint.Endpoint) ([]*endpoint.Endpoint, error) {
+	for _, ep := range endpoints {
+		if ep.RecordType == endpoint.RecordTypeCNAME &&
+			len(ep.Targets) > 0 &&
+			p.isAWSLoadBalancer(ep.Targets[0]) &&
+			ep.GetAliasProperty() == endpoint.AliasTrue {
+			ep.WithLabel(endpoint.AWSSDDualstackLabelKey, "true")
+		}
+		ep.DeleteProviderSpecificProperty(endpoint.ProviderSpecificAlias)
+		p.warnOnRecordTypeDrift(ep)
+	}
+	return endpoints, nil
+}
+
+func (p *AWSSDProvider) warnOnRecordTypeDrift(ep *endpoint.Endpoint) {
+	if ep.RecordType != endpoint.RecordTypeCNAME || len(ep.Targets) == 0 {
+		return
+	}
+
+	p.mu.RLock()
+	current, exists := p.observedRecordTypes[idna.NormalizeDNSName(ep.DNSName)]
+	p.mu.RUnlock()
+
+	desired := sets.Sorted(sets.New(p.serviceTypesFromEndpoint(ep)...))
+	if !exists || slices.Equal(current, desired) {
+		return
+	}
+
+	log.Warnf("Cloud Map service for %q has record types %v but desired types are %v; record types are immutable, recreate the service to change them", ep.DNSName, current, desired)
 }
 
 // ApplyChanges applies Kubernetes changes in endpoints to AWS API
@@ -314,7 +362,8 @@ func (p *AWSSDProvider) submitCreates(ctx context.Context, namespaces []*sdtypes
 			srvName := strings.TrimSuffix(hostname, "."+nsName)
 
 			srv := services[srvName]
-			if srv == nil {
+			switch {
+			case srv == nil:
 				// when service is missing create a new one
 				srv, err = p.CreateService(ctx, &nsID, &srvName, ch)
 				if err != nil {
@@ -322,11 +371,23 @@ func (p *AWSSDProvider) submitCreates(ctx context.Context, namespaces []*sdtypes
 				}
 				// update a local list of services
 				services[*srv.Name] = srv
-			} else if ch.RecordTTL.IsConfigured() && *srv.DnsConfig.DnsRecords[0].TTL != int64(ch.RecordTTL) {
-				// update service when TTL differ
-				err = p.UpdateService(ctx, srv, ch)
-				if err != nil {
-					return err
+			case srv.Description == nil:
+				// Records() skips services without a Description, so instances registered here could never be deleted.
+				log.Warnf("Skipping %q: service %q exists but is not owned by ExternalDNS", ch.DNSName, srvName)
+				continue
+			default:
+				needsUpdate := aws.ToString(srv.Description) != ch.Labels[endpoint.AWSSDDescriptionLabel]
+				if ch.RecordTTL.IsConfigured() {
+					// No DNS records: let UpdateService return its soft error, as before.
+					needsUpdate = needsUpdate || srv.DnsConfig == nil || len(srv.DnsConfig.DnsRecords) == 0 ||
+						slices.ContainsFunc(srv.DnsConfig.DnsRecords, func(r sdtypes.DnsRecord) bool {
+							return r.TTL == nil || *r.TTL != int64(ch.RecordTTL)
+						})
+				}
+				if needsUpdate {
+					if err = p.UpdateService(ctx, srv, ch); err != nil {
+						return err
+					}
 				}
 			}
 
@@ -439,7 +500,6 @@ func (p *AWSSDProvider) ListServicesByNamespaceID(ctx context.Context, namespace
 func (p *AWSSDProvider) CreateService(ctx context.Context, namespaceID *string, srvName *string, ep *endpoint.Endpoint) (*sdtypes.Service, error) {
 	log.Infof("Creating a new service \"%s\" in \"%s\" namespace", *srvName, *namespaceID)
 
-	srvType := p.serviceTypeFromEndpoint(ep)
 	routingPolicy := p.routingPolicyFromEndpoint(ep)
 
 	ttl := int64(defaultTTL)
@@ -457,10 +517,7 @@ func (p *AWSSDProvider) CreateService(ctx context.Context, namespaceID *string, 
 		Description: aws.String(ep.Labels[endpoint.AWSSDDescriptionLabel]),
 		DnsConfig: &sdtypes.DnsConfig{
 			RoutingPolicy: routingPolicy,
-			DnsRecords: []sdtypes.DnsRecord{{
-				Type: srvType,
-				TTL:  aws.Int64(ttl),
-			}},
+			DnsRecords:    dnsRecords(p.serviceTypesFromEndpoint(ep), ttl),
 		},
 		NamespaceId: namespaceID,
 		Tags:        p.tags,
@@ -476,15 +533,17 @@ func (p *AWSSDProvider) CreateService(ctx context.Context, namespaceID *string, 
 func (p *AWSSDProvider) UpdateService(ctx context.Context, service *sdtypes.Service, ep *endpoint.Endpoint) error {
 	log.Infof("Updating service \"%s\"", *service.Name)
 
-	srvType := p.serviceTypeFromEndpoint(ep)
-
-	ttl := int64(defaultTTL)
-	if ep.RecordTTL.IsConfigured() {
-		ttl = int64(ep.RecordTTL)
-	}
-
 	if p.dryRun {
 		return nil
+	}
+
+	if service.DnsConfig == nil || len(service.DnsConfig.DnsRecords) == 0 {
+		return provider.NewSoftErrorf("service %q has no DNS records to update", aws.ToString(service.Name))
+	}
+
+	records := service.DnsConfig.DnsRecords
+	if ep.RecordTTL.IsConfigured() {
+		records = dnsRecords(recordTypes(records), int64(ep.RecordTTL))
 	}
 
 	_, err := p.client.UpdateService(ctx, &sd.UpdateServiceInput{
@@ -492,10 +551,7 @@ func (p *AWSSDProvider) UpdateService(ctx context.Context, service *sdtypes.Serv
 		Service: &sdtypes.ServiceChange{
 			Description: aws.String(ep.Labels[endpoint.AWSSDDescriptionLabel]),
 			DnsConfig: &sdtypes.DnsConfigChange{
-				DnsRecords: []sdtypes.DnsRecord{{
-					Type: srvType,
-					TTL:  aws.Int64(ttl),
-				}},
+				DnsRecords: records,
 			},
 		},
 	})
@@ -646,7 +702,7 @@ func (p *AWSSDProvider) serviceTypeFromEndpoint(ep *endpoint.Endpoint) sdtypes.R
 	case endpoint.RecordTypeCNAME:
 		// FIXME service type is derived from the first target only. Theoretically this may be problem.
 		// But I don't see a scenario where one endpoint contains targets of different types.
-		if p.isAWSLoadBalancer(ep.Targets[0]) {
+		if len(ep.Targets) > 0 && p.isAWSLoadBalancer(ep.Targets[0]) {
 			// ALIAS target uses DNS record of type A
 			return sdtypes.RecordTypeA
 		}
@@ -656,6 +712,40 @@ func (p *AWSSDProvider) serviceTypeFromEndpoint(ep *endpoint.Endpoint) sdtypes.R
 	default:
 		return sdtypes.RecordTypeA
 	}
+}
+
+// serviceTypesFromEndpoint returns A+AAAA when AdjustEndpoints marked the
+// endpoint dual-stack, otherwise the single primary type.
+func (p *AWSSDProvider) serviceTypesFromEndpoint(ep *endpoint.Endpoint) []sdtypes.RecordType {
+	primary := p.serviceTypeFromEndpoint(ep)
+
+	if ep.RecordType == endpoint.RecordTypeCNAME &&
+		len(ep.Targets) > 0 &&
+		p.isAWSLoadBalancer(ep.Targets[0]) &&
+		ep.Labels[endpoint.AWSSDDualstackLabelKey] == "true" {
+		return []sdtypes.RecordType{sdtypes.RecordTypeA, sdtypes.RecordTypeAaaa}
+	}
+
+	return []sdtypes.RecordType{primary}
+}
+
+func dnsRecords(types []sdtypes.RecordType, ttl int64) []sdtypes.DnsRecord {
+	records := make([]sdtypes.DnsRecord, 0, len(types))
+	for _, recordType := range types {
+		records = append(records, sdtypes.DnsRecord{
+			Type: recordType,
+			TTL:  aws.Int64(ttl),
+		})
+	}
+	return records
+}
+
+func recordTypes(records []sdtypes.DnsRecord) []sdtypes.RecordType {
+	types := make([]sdtypes.RecordType, 0, len(records))
+	for _, record := range records {
+		types = append(types, record.Type)
+	}
+	return types
 }
 
 // determine if a given hostname belongs to an AWS load balancer

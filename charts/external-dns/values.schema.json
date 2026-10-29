@@ -92,6 +92,19 @@
       "description": "[Environment variables](https://kubernetes.io/docs/tasks/inject-data-application/define-environment-variable-container/) for the `external-dns` container.",
       "type": "array"
     },
+    "eventsEmit": {
+      "description": "_Kubernetes_ events to emit; valid values are `RecordReady`, `RecordDeleted` \u0026 `RecordError`. Setting this also grants the RBAC permission to create `events.k8s.io` events.",
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "enum": [
+          "RecordReady",
+          "RecordDeleted",
+          "RecordError"
+        ]
+      }
+    },
     "excludeDomains": {
       "description": "Intentionally exclude domains from being managed.",
       "type": "array"
@@ -145,6 +158,10 @@
           }
         }
       }
+    },
+    "hostAliases": {
+      "description": "[Host aliases](https://kubernetes.io/docs/tasks/network/customize-hosts-file-for-pods/) to add to the `Pod` definition, injected into the pod's `/etc/hosts`.",
+      "type": "array"
     },
     "image": {
       "type": "object",
@@ -507,8 +524,30 @@
               "type": "object"
             },
             "securityContext": {
-              "description": "[Pod security context](https://kubernetes.io/docs/tasks/configure-pod-container/security-context/#set-the-security-context-for-a-container) for the `webhook` container.",
-              "type": "object"
+              "description": "[Security context](https://kubernetes.io/docs/tasks/configure-pod-container/security-context/#set-the-security-context-for-a-container) for the `webhook` container.",
+              "type": "object",
+              "properties": {
+                "allowPrivilegeEscalation": {
+                  "type": "boolean"
+                },
+                "capabilities": {
+                  "type": "object",
+                  "properties": {
+                    "drop": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    }
+                  }
+                },
+                "privileged": {
+                  "type": "boolean"
+                },
+                "readOnlyRootFilesystem": {
+                  "type": "boolean"
+                }
+              }
             },
             "service": {
               "type": "object",
@@ -609,12 +648,13 @@
       }
     },
     "registry": {
-      "description": "Specify the registry for storing ownership and labels. Valid values are `txt`, `aws-sd`, `dynamodb` \u0026 `noop`.",
+      "description": "Specify the registry for storing ownership and labels. Valid values are `txt`, `aws-sd`, `crd`, `dynamodb` \u0026 `noop`.",
       "default": "txt",
       "type": "string",
       "enum": [
         "txt",
         "aws-sd",
+        "crd",
         "dynamodb",
         "noop"
       ]

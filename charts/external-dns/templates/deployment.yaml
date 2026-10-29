@@ -70,6 +70,10 @@ spec:
       dnsConfig:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      {{- with .Values.hostAliases }}
+      hostAliases:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       {{- with .Values.initContainers }}
       initContainers:
         {{- toYaml . | nindent 8 }}
@@ -95,6 +99,9 @@ spec:
             - --interval={{ .Values.interval }}
             {{- if .Values.triggerLoopOnEvent }}
             - --events
+            {{- end }}
+            {{- range .Values.eventsEmit }}
+            - --events-emit={{ . }}
             {{- end }}
             {{- range .Values.sources }}
             - --source={{ . }}

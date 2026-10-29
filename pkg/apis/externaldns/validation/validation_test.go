@@ -24,6 +24,7 @@ import (
 	"k8s.io/client-go/rest"
 
 	"sigs.k8s.io/external-dns/pkg/apis/externaldns"
+	"sigs.k8s.io/external-dns/source/annotations"
 )
 
 func TestValidateFlags(t *testing.T) {
@@ -108,6 +109,40 @@ func TestValidateFlags(t *testing.T) {
 	cfg.AnnotationPrefix = "external-dns.kubernetes.io/"
 	require.NoError(t, ValidateConfig(cfg))
 
+	t.Run("enable-legacy-annotation-prefix", func(t *testing.T) {
+		for _, tc := range []struct {
+			prefix  string
+			wantErr bool
+		}{
+			{prefix: "external-dns.kubernetes.io/"},
+			{prefix: "custom.io/"},
+			{prefix: annotations.LegacyAnnotationPrefix, wantErr: true},
+			{prefix: annotations.LegacyAnnotationPrefix + "v2/", wantErr: true},
+		} {
+			t.Run(tc.prefix, func(t *testing.T) {
+				cfg := newValidConfig(t)
+				cfg.AnnotationPrefix = tc.prefix
+				cfg.EnableLegacyAnnotationPrefix = true
+				if tc.wantErr {
+					require.ErrorContains(t, ValidateConfig(cfg), "--enable-legacy-annotation-prefix")
+				} else {
+					require.NoError(t, ValidateConfig(cfg))
+				}
+			})
+		}
+	})
+
+	t.Run("enable-legacy-annotation-prefix accepts filters and templates that name the legacy prefix", func(t *testing.T) {
+		// The legacy key is kept alongside its configured equivalent, so filters and templates written
+		// against either prefix keep working while the flag is on.
+		cfg := newValidConfig(t)
+		cfg.EnableLegacyAnnotationPrefix = true
+		cfg.AnnotationFilter = annotations.LegacyAnnotationPrefix + "controller=dns"
+		cfg.FQDNTemplate = []string{`{{ index .Annotations "` + annotations.LegacyAnnotationPrefix + `hostname" }}`}
+		cfg.TargetTemplate = []string{`{{ index .Annotations "` + annotations.LegacyAnnotationPrefix + `target" }}`}
+		require.NoError(t, ValidateConfig(cfg))
+	})
+
 	t.Run("kube-api-qps and kube-api-burst", func(t *testing.T) {
 		for _, tc := range []struct {
 			name    string
@@ -155,7 +190,7 @@ func TestValidateBadIgnoreHostnameAnnotationsConfig(t *testing.T) {
 	cfg.IgnoreHostnameAnnotation = true
 	cfg.FQDNTemplate = []string{}
 
-	assert.Error(t, ValidateConfig(cfg))
+	require.Error(t, ValidateConfig(cfg))
 }
 
 func TestValidateBadRfc2136Config(t *testing.T) {
@@ -170,7 +205,7 @@ func TestValidateBadRfc2136Config(t *testing.T) {
 
 	err := ValidateConfig(cfg)
 
-	assert.Error(t, err)
+	require.Error(t, err)
 }
 
 func TestValidateBadRfc2136Batch(t *testing.T) {
@@ -185,7 +220,7 @@ func TestValidateBadRfc2136Batch(t *testing.T) {
 
 	err := ValidateConfig(cfg)
 
-	assert.Error(t, err)
+	require.Error(t, err)
 }
 
 func TestValidateGoodRfc2136Config(t *testing.T) {
@@ -202,7 +237,7 @@ func TestValidateGoodRfc2136Config(t *testing.T) {
 
 	err := ValidateConfig(cfg)
 
-	assert.NoError(t, err)
+	require.NoError(t, err)
 }
 
 func TestValidateBadRfc2136GssTsigConfig(t *testing.T) {
@@ -305,7 +340,7 @@ func TestValidateBadRfc2136GssTsigConfig(t *testing.T) {
 	for _, cfg := range invalidRfc2136GssTsigConfigs {
 		err := ValidateConfig(cfg)
 
-		assert.Error(t, err)
+		require.Error(t, err)
 	}
 }
 
@@ -332,7 +367,89 @@ func TestValidateGoodRfc2136GssTsigConfig(t *testing.T) {
 	for _, cfg := range validRfc2136GssTsigConfigs {
 		err := ValidateConfig(cfg)
 
-		assert.NoError(t, err)
+		require.NoError(t, err)
+	}
+}
+
+func TestValidateConfigForRfc2136(t *testing.T) {
+	tests := []struct {
+		name    string
+		cfg     externaldns.Config
+		wantErr string
+	}{
+		{
+			name: "minimal config passes",
+			cfg: externaldns.Config{
+				RFC2136MinTTL:          3600,
+				RFC2136BatchChangeSize: 50,
+			},
+		},
+		{
+			name: "negative min ttl is rejected",
+			cfg: externaldns.Config{
+				RFC2136MinTTL:          -1,
+				RFC2136BatchChangeSize: 50,
+			},
+			wantErr: "TTL specified for rfc2136 is negative",
+		},
+		{
+			name: "insecure combined with gss-tsig is rejected",
+			cfg: externaldns.Config{
+				RFC2136Insecure:        true,
+				RFC2136GSSTSIG:         true,
+				RFC2136MinTTL:          3600,
+				RFC2136BatchChangeSize: 50,
+			},
+			wantErr: "--rfc2136-insecure and --rfc2136-gss-tsig are mutually exclusive arguments",
+		},
+		{
+			name: "axfr-insecure without axfr is rejected",
+			cfg: externaldns.Config{
+				RFC2136AXFRInsecure:    true,
+				RFC2136AXFR:            false,
+				RFC2136MinTTL:          3600,
+				RFC2136BatchChangeSize: 50,
+			},
+			wantErr: "--rfc2136-axfr-insecure requires --rfc2136-axfr",
+		},
+		{
+			name: "axfr-insecure with axfr passes",
+			cfg: externaldns.Config{
+				RFC2136AXFRInsecure:    true,
+				RFC2136AXFR:            true,
+				RFC2136MinTTL:          3600,
+				RFC2136BatchChangeSize: 50,
+			},
+		},
+		{
+			name: "gss-tsig without kerberos credentials is rejected",
+			cfg: externaldns.Config{
+				RFC2136GSSTSIG:         true,
+				RFC2136MinTTL:          3600,
+				RFC2136BatchChangeSize: 50,
+			},
+			wantErr: "--rfc2136-kerberos-realm, --rfc2136-kerberos-username, and --rfc2136-kerberos-password are required when specifying --rfc2136-gss-tsig option",
+		},
+		{
+			name: "batch change size below one is rejected",
+			cfg: externaldns.Config{
+				RFC2136MinTTL:          3600,
+				RFC2136BatchChangeSize: 0,
+			},
+			wantErr: "batch size specified for rfc2136 cannot be less than 1",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateConfigForRfc2136(&tt.cfg)
+
+			if tt.wantErr == "" {
+				require.NoError(t, err)
+				return
+			}
+			require.EqualError(t, err, tt.wantErr)
+		})
 	}
 }
 
@@ -348,7 +465,7 @@ func TestValidateBadAzureConfig(t *testing.T) {
 
 	err := ValidateConfig(cfg)
 
-	assert.Error(t, err)
+	require.Error(t, err)
 }
 
 func TestValidateGoodAzureConfig(t *testing.T) {
@@ -365,7 +482,7 @@ func TestValidateGoodAzureConfig(t *testing.T) {
 
 	err := ValidateConfig(cfg)
 
-	assert.NoError(t, err)
+	require.NoError(t, err)
 }
 
 func TestValidateCreatePTRRequiresManagedRecordType(t *testing.T) {
@@ -374,7 +491,7 @@ func TestValidateCreatePTRRequiresManagedRecordType(t *testing.T) {
 	// ManagedDNSRecordTypes defaults to [A, AAAA, CNAME] — no PTR
 
 	err := ValidateConfig(cfg)
-	assert.Error(t, err)
+	require.Error(t, err)
 	assert.Contains(t, err.Error(), "--create-ptr requires PTR in --managed-record-types")
 }
 
@@ -384,5 +501,68 @@ func TestValidateCreatePTRWithPTRManagedPasses(t *testing.T) {
 	cfg.ManagedDNSRecordTypes = append(cfg.ManagedDNSRecordTypes, "PTR")
 
 	err := ValidateConfig(cfg)
-	assert.NoError(t, err)
+	require.NoError(t, err)
+}
+
+func TestValidateNamespaces(t *testing.T) {
+	tests := []struct {
+		name        string
+		namespaces  []string
+		sources     []string
+		expectedErr string
+	}{
+		{
+			name:       "no namespace",
+			sources:    []string{"gateway-httproute"},
+			namespaces: nil,
+		},
+		{
+			name:       "single namespace with a source watching one",
+			sources:    []string{"gateway-httproute"},
+			namespaces: []string{"team-a"},
+		},
+		{
+			name:       "several namespaces with sources watching many",
+			sources:    []string{"node", "gloo-proxy"},
+			namespaces: []string{"team-a", "team-b"},
+		},
+		{
+			name:       "duplicated namespace with a source watching one",
+			sources:    []string{"gateway-httproute"},
+			namespaces: []string{"team-a", "team-a"},
+		},
+		{
+			name:       "all namespaces subsuming another with a source watching one",
+			sources:    []string{"gateway-httproute"},
+			namespaces: []string{"team-a", ""},
+		},
+		{
+			name:        "several namespaces with a source watching one",
+			sources:     []string{"gateway-httproute"},
+			namespaces:  []string{"team-a", "team-b"},
+			expectedErr: "--namespace accepts a single value with the following sources: gateway-httproute",
+		},
+		{
+			name:        "several namespaces report every unsupported source once",
+			sources:     []string{"node", "gateway-httproute", "gateway-grpcroute", "gateway-httproute"},
+			namespaces:  []string{"team-a", "team-b"},
+			expectedErr: "--namespace accepts a single value with the following sources: gateway-httproute, gateway-grpcroute",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := newValidConfig(t)
+			cfg.Sources = tt.sources
+			cfg.Namespaces = tt.namespaces
+
+			err := ValidateConfig(cfg)
+
+			if tt.expectedErr == "" {
+				assert.NoError(t, err)
+				return
+			}
+			assert.ErrorContains(t, err, tt.expectedErr)
+		})
+	}
 }

@@ -15,8 +15,10 @@ package informers
 
 import (
 	"fmt"
+	"strings"
 	"testing"
 
+	log "github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
@@ -26,6 +28,9 @@ import (
 	"k8s.io/client-go/tools/cache"
 
 	"sigs.k8s.io/external-dns/source/annotations"
+	"sigs.k8s.io/external-dns/source/annotations/schema"
+
+	logtest "sigs.k8s.io/external-dns/internal/testutils/log"
 )
 
 func TestIndexerWithOptions_FilterByAnnotation(t *testing.T) {
@@ -41,7 +46,7 @@ func TestIndexerWithOptions_FilterByAnnotation(t *testing.T) {
 	obj.SetName("test-object")
 
 	keys, err := indexers[IndexWithSelectors](obj)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	assert.Equal(t, []string{"default/test-object"}, keys)
 }
 
@@ -57,7 +62,7 @@ func TestIndexerWithOptions_FilterByLabel(t *testing.T) {
 	obj.SetName("test-object")
 
 	keys, err := indexers[IndexWithSelectors](obj)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	assert.Equal(t, []string{"default/test-object"}, keys)
 }
 
@@ -73,8 +78,8 @@ func TestIndexerWithOptions_NoMatch(t *testing.T) {
 	obj.SetName("test-object")
 
 	keys, err := indexers[IndexWithSelectors](obj)
-	assert.NoError(t, err)
-	assert.Nil(t, keys)
+	require.NoError(t, err)
+	require.Nil(t, keys)
 }
 
 func TestIndexerWithOptions_InvalidType(t *testing.T) {
@@ -83,8 +88,8 @@ func TestIndexerWithOptions_InvalidType(t *testing.T) {
 	obj := "invalid-object"
 
 	keys, err := indexers[IndexWithSelectors](obj)
-	assert.Error(t, err)
-	assert.Nil(t, keys)
+	require.Error(t, err)
+	require.Nil(t, keys)
 	assert.Contains(t, err.Error(), "object is not of type")
 }
 
@@ -96,7 +101,7 @@ func TestIndexerWithOptions_EmptyOptions(t *testing.T) {
 		obj.SetName("test-object")
 
 		keys, err := indexers[IndexWithSelectors](obj)
-		assert.NoError(t, err)
+		require.NoError(t, err)
 		assert.Equal(t, []string{"default/test-object"}, keys)
 	})
 
@@ -106,7 +111,7 @@ func TestIndexerWithOptions_EmptyOptions(t *testing.T) {
 		node.SetName("my-node")
 
 		keys, err := indexers[IndexWithSelectors](node)
-		assert.NoError(t, err)
+		require.NoError(t, err)
 		assert.Equal(t, []string{"my-node"}, keys)
 	})
 }
@@ -124,8 +129,8 @@ func TestIndexerWithOptions_AnnotationFilterNoMatch(t *testing.T) {
 	obj.SetName("test-object")
 
 	keys, err := indexers[IndexWithSelectors](obj)
-	assert.NoError(t, err)
-	assert.Nil(t, keys)
+	require.NoError(t, err)
+	require.Nil(t, keys)
 }
 
 func TestIndexSelectorWithAnnotationFilter(t *testing.T) {
@@ -141,8 +146,195 @@ func TestIndexSelectorWithAnnotationFilter(t *testing.T) {
 	t.Run("nil selector stored as nil", func(t *testing.T) {
 		options := &IndexSelectorOptions{}
 		IndexSelectorWithAnnotationFilter(nil)(options)
-		assert.Nil(t, options.annotationFilter)
+		require.Nil(t, options.annotationFilter)
 	})
+}
+
+func TestIndexSelectorWithAnnotationValidation(t *testing.T) {
+	t.Run("stores schema in options", func(t *testing.T) {
+		s := schema.New(schema.Options{Mode: schema.ModeStrict}).WithSource("pod")
+		options := &IndexSelectorOptions{}
+		IndexSelectorWithAnnotationValidation(s)(options)
+		assert.Same(t, s, options.schema)
+	})
+
+	t.Run("nil schema is a no-op", func(t *testing.T) {
+		options := &IndexSelectorOptions{}
+		IndexSelectorWithAnnotationValidation(nil)(options)
+		assert.Nil(t, options.schema)
+	})
+
+	t.Run("mode off is a no-op", func(t *testing.T) {
+		options := &IndexSelectorOptions{}
+		IndexSelectorWithAnnotationValidation(schema.New(schema.Options{Mode: schema.ModeOff}).WithSource("pod"))(options)
+		assert.Nil(t, options.schema)
+	})
+}
+
+// schemaWithFixture builds a schema with a single annotation spec; test-local shortcut.
+func schemaWithFixture(keySuffix string, cfg schema.Config, opts schema.Options) *schema.Schema {
+	return schema.NewWithSpecs([]schema.AnnotationSpec{{KeySuffix: keySuffix, Config: cfg}}, opts)
+}
+
+func TestIndexerWithOptions_AnnotationValidation(t *testing.T) {
+	const testKeySuffix = "test-annotation"
+	const testKey = "external-dns.kubernetes.io/" + testKeySuffix
+
+	strictCfg := schema.Config{
+		Validators:    []schema.Validator{schema.ValidateOneOf("valid-value")},
+		WarnMessage:   "falls back to default",
+		StrictMessage: "excluded entirely",
+	}
+	warnOnlyCfg := schema.Config{
+		Validators:  []schema.Validator{schema.ValidateOneOf("valid-value")},
+		WarnMessage: "falls back to default",
+	}
+
+	makePod := func(annotationsMap map[string]string) *corev1.Pod {
+		p := &corev1.Pod{}
+		p.SetName("test-pod")
+		p.SetNamespace("default")
+		p.SetAnnotations(annotationsMap)
+		return p
+	}
+
+	type testCase struct {
+		name        string
+		cfg         schema.Config
+		source      string
+		mode        schema.Mode
+		annotations map[string]string
+		wantIndexed bool
+	}
+
+	tests := []testCase{
+		{
+			name:        "valid value indexed in warn mode",
+			cfg:         strictCfg,
+			source:      "pod",
+			mode:        schema.ModeWarn,
+			annotations: map[string]string{testKey: "valid-value"},
+			wantIndexed: true,
+		},
+		{
+			name:        "valid value indexed in strict mode",
+			cfg:         strictCfg,
+			source:      "pod",
+			mode:        schema.ModeStrict,
+			annotations: map[string]string{testKey: "valid-value"},
+			wantIndexed: true,
+		},
+		{
+			name:        "invalid value in warn mode stays indexed",
+			cfg:         strictCfg,
+			source:      "pod",
+			mode:        schema.ModeWarn,
+			annotations: map[string]string{testKey: "invalid-value"},
+			wantIndexed: true,
+		},
+		{
+			name:        "invalid value in strict mode is excluded",
+			cfg:         strictCfg,
+			source:      "pod",
+			mode:        schema.ModeStrict,
+			annotations: map[string]string{testKey: "invalid-value"},
+			wantIndexed: false,
+		},
+		{
+			name:        "invalid value in strict mode with no StrictMessage stays indexed",
+			cfg:         warnOnlyCfg,
+			source:      "pod",
+			mode:        schema.ModeStrict,
+			annotations: map[string]string{testKey: "invalid-value"},
+			wantIndexed: true,
+		},
+		{
+			name:        "annotation absent stays indexed",
+			cfg:         strictCfg,
+			source:      "pod",
+			mode:        schema.ModeStrict,
+			annotations: nil,
+			wantIndexed: true,
+		},
+		{
+			name:        "source not configured skips validation entirely",
+			cfg:         strictCfg,
+			source:      "",
+			mode:        schema.ModeStrict,
+			annotations: map[string]string{testKey: "invalid-value"},
+			wantIndexed: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var opts []func(*IndexSelectorOptions)
+			if tt.source != "" {
+				s := schemaWithFixture(testKeySuffix, tt.cfg, schema.Options{Mode: tt.mode}).WithSource(tt.source)
+				opts = append(opts, IndexSelectorWithAnnotationValidation(s))
+			}
+			indexers := IndexerWithOptions[*corev1.Pod](opts...)
+			keys, err := indexers[IndexWithSelectors](makePod(tt.annotations))
+			require.NoError(t, err)
+			if tt.wantIndexed {
+				assert.Equal(t, []string{"default/test-pod"}, keys)
+			} else {
+				assert.Nil(t, keys)
+			}
+		})
+	}
+}
+
+// TestIndexerWithOptions_AnnotationValidation_DedupesRepeatedCall covers client-go's
+// old-object/new-object index recompute on Update: the same object, annotations, and
+// outcome must only be logged once when the index func runs twice back-to-back for it.
+func TestIndexerWithOptions_AnnotationValidation_DedupesRepeatedCall(t *testing.T) {
+	const testKeySuffix = "test-annotation"
+	const testKey = "external-dns.kubernetes.io/" + testKeySuffix
+
+	makePod := func(annotationsMap map[string]string) *corev1.Pod {
+		p := &corev1.Pod{}
+		p.SetName("test-pod")
+		p.SetNamespace("default")
+		p.SetAnnotations(annotationsMap)
+		return p
+	}
+
+	s := schemaWithFixture(testKeySuffix, schema.Config{
+		Validators:    []schema.Validator{schema.ValidateOneOf("valid-value")},
+		StrictMessage: "excluded entirely",
+	}, schema.Options{Mode: schema.ModeStrict}).WithSource("pod")
+	indexFn := IndexerWithOptions[*corev1.Pod](
+		IndexSelectorWithAnnotationValidation(s),
+	)[IndexWithSelectors]
+
+	pod := makePod(map[string]string{testKey: "invalid-value"})
+	hook := logtest.LogsUnderTestWithLogLevel(log.DebugLevel, t)
+
+	_, err := indexFn(pod)
+	require.NoError(t, err)
+	_, err = indexFn(pod)
+	require.NoError(t, err)
+
+	count := 0
+	for _, entry := range hook.AllEntries() {
+		if strings.Contains(entry.Message, "excluded entirely") {
+			count++
+		}
+	}
+	assert.Equal(t, 1, count, "expected the warning to be logged once for two back-to-back identical calls")
+
+	otherPod := makePod(map[string]string{testKey: "invalid-value-2"})
+	_, err = indexFn(otherPod)
+	require.NoError(t, err)
+
+	count = 0
+	for _, entry := range hook.AllEntries() {
+		if strings.Contains(entry.Message, "excluded entirely") {
+			count++
+		}
+	}
+	assert.Equal(t, 2, count, "a genuinely different call must still log")
 }
 
 func TestIndexerWithOptions_LabelKey(t *testing.T) {
@@ -158,7 +350,7 @@ func TestIndexerWithOptions_LabelKey(t *testing.T) {
 		es.SetLabels(map[string]string{discoveryv1.LabelServiceName: "my-service"})
 
 		keys, err := indexFn(es)
-		assert.NoError(t, err)
+		require.NoError(t, err)
 		assert.Equal(t, []string{"default/my-service"}, keys)
 	})
 
@@ -169,14 +361,14 @@ func TestIndexerWithOptions_LabelKey(t *testing.T) {
 		es.SetLabels(map[string]string{})
 
 		keys, err := indexFn(es)
-		assert.NoError(t, err)
-		assert.Nil(t, keys)
+		require.NoError(t, err)
+		require.Nil(t, keys)
 	})
 
 	t.Run("wrong type returns error", func(t *testing.T) {
 		keys, err := indexFn(&corev1.Service{})
-		assert.Error(t, err)
-		assert.Nil(t, keys)
+		require.Error(t, err)
+		require.Nil(t, keys)
 	})
 }
 
@@ -187,20 +379,20 @@ func TestGetByKey_ObjectExists(t *testing.T) {
 	pod.SetName("test-pod")
 
 	err := indexer.Add(pod)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
-	result, err := GetByKey[*corev1.Pod](indexer, "default/test-pod")
-	assert.NoError(t, err)
-	assert.NotNil(t, result)
+	result, err := getByKey[*corev1.Pod](indexer, "default/test-pod")
+	require.NoError(t, err)
+	require.NotNil(t, result)
 	assert.Equal(t, "test-pod", result.GetName())
 }
 
 func TestGetByKey_ObjectDoesNotExist(t *testing.T) {
 	indexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
 
-	result, err := GetByKey[*corev1.Pod](indexer, "default/non-existent-pod")
-	assert.NoError(t, err)
-	assert.Nil(t, result)
+	result, err := getByKey[*corev1.Pod](indexer, "default/non-existent-pod")
+	require.NoError(t, err)
+	require.Nil(t, result)
 }
 
 func TestGetByKey_TypeAssertionFailure(t *testing.T) {
@@ -210,12 +402,12 @@ func TestGetByKey_TypeAssertionFailure(t *testing.T) {
 	service.SetName("test-service")
 
 	err := indexer.Add(service)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
-	result, err := GetByKey[*corev1.Pod](indexer, "default/test-service")
-	assert.Error(t, err)
+	result, err := getByKey[*corev1.Pod](indexer, "default/test-service")
+	require.Error(t, err)
 	assert.Contains(t, err.Error(), "object is not of type")
-	assert.Nil(t, result)
+	require.Nil(t, result)
 }
 
 type errIndexer struct {
@@ -400,11 +592,11 @@ func TestIndexSelectorWithFunctions(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			keys, err := tt.indexers[IndexWithSelectors](tt.obj)
 			if tt.wantErr {
-				assert.Error(t, err)
-				assert.Nil(t, keys)
+				require.Error(t, err)
+				require.Nil(t, keys)
 				return
 			}
-			assert.NoError(t, err)
+			require.NoError(t, err)
 			assert.Equal(t, tt.wantKeys, keys)
 		})
 	}

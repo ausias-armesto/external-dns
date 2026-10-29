@@ -22,14 +22,8 @@ import (
 	"slices"
 
 	log "github.com/sirupsen/logrus"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"sigs.k8s.io/external-dns/internal/sets"
-	"sigs.k8s.io/external-dns/pkg/events"
-)
-
-const (
-	msg = "No endpoints could be generated from '%s/%s/%s'"
 )
 
 // SuitableType returns the DNS record type for the given target:
@@ -45,14 +39,32 @@ func SuitableType(target string) string {
 	return RecordTypeAAAA
 }
 
-// HasNoEmptyEndpoints checks if the endpoint list is empty and logs
-// a debug message if so. Returns true if empty, false otherwise.
-func HasNoEmptyEndpoints(
-	endpoints []*Endpoint,
-	rType string, entity metav1.ObjectMetaAccessor,
-) bool {
+// RequiresTrailingDot reports whether the record type's target is a single
+// domain name that must be an absolute FQDN (i.e. end with a trailing dot)
+// when written to a provider. CNAME and DNAME are such types; providers that
+// canonicalize the target use this to append the dot when it is missing.
+func RequiresTrailingDot(recordType string) bool {
+	switch recordType {
+	case RecordTypeCNAME, RecordTypeDNAME:
+		return true
+	default:
+		return false
+	}
+}
+
+// namedObject is the subset of metav1.Object that IsEmptyEndpoints logs. It is
+// declared here so endpoint does not import k8s.io/apimachinery/pkg/apis/meta/v1,
+// which would pull the Kubernetes client stack into every webhook provider.
+type namedObject interface {
+	GetNamespace() string
+	GetName() string
+}
+
+// IsEmptyEndpoints reports whether endpoints is empty, logging at debug level
+// so a source object that yields no records is still traceable.
+func IsEmptyEndpoints(endpoints []*Endpoint, rType string, entity namedObject) bool {
 	if len(endpoints) == 0 {
-		log.Debugf(msg, rType, entity.GetObjectMeta().GetNamespace(), entity.GetObjectMeta().GetName())
+		log.Debugf("No endpoints could be generated from '%s/%s/%s'", rType, entity.GetNamespace(), entity.GetName())
 		return true
 	}
 	return false
@@ -86,10 +98,10 @@ func EndpointsForHostname(hostname string, targets Targets, ttl TTL, providerSpe
 	return endpoints
 }
 
-// AttachRefObject sets the same ObjectReference on every endpoint in eps.
+// AttachRefObject sets the same ObjectRef on every endpoint in eps.
 // The reference is shared across all endpoints, so callers should create it once
 // per source object rather than once per endpoint.
-func AttachRefObject(eps []*Endpoint, ref *events.ObjectReference) {
+func AttachRefObject(eps []*Endpoint, ref *ObjectRef) {
 	for _, ep := range eps {
 		ep.WithRefObject(ref)
 	}
@@ -143,7 +155,7 @@ func MergeEndpoints(endpoints []*Endpoint) []*Endpoint {
 	}
 
 	endpointMap := make(map[EndpointKey]*Endpoint)
-	cnameTargets := make(map[string]string) // DNSName+SetIdentifier -> first target seen
+	singleTargets := make(map[string]string) // recordType/DNSName+SetIdentifier -> first target seen
 
 	for _, ep := range endpoints {
 		key := EndpointKey{
@@ -152,20 +164,20 @@ func MergeEndpoints(endpoints []*Endpoint) []*Endpoint {
 			SetIdentifier: ep.SetIdentifier,
 			RecordTTL:     ep.RecordTTL,
 		}
-		// CNAME records can only have one target per DNS spec, and they should not be merged.
-		if ep.RecordType == RecordTypeCNAME {
+		// CNAME and DNAME records can only have one target per DNS spec, and they should not be merged.
+		if ep.RecordType == RecordTypeCNAME || ep.RecordType == RecordTypeDNAME {
 			if len(ep.Targets) == 0 {
-				log.Debugf("Skipping CNAME endpoint %q with no targets", ep.DNSName)
+				log.Debugf("Skipping %s endpoint %q with no targets", ep.RecordType, ep.DNSName)
 				continue
 			}
 			key.Target = ep.Targets[0]
-			cnameKey := ep.DNSName + "/" + ep.SetIdentifier
+			singleKey := ep.RecordType + "/" + ep.DNSName + "/" + ep.SetIdentifier
 			// This will be caught by the provider when it tries to create the record, but log a warning here to make it more obvious.
-			// TODO: add metric for CNAME conflicts
-			if first, ok := cnameTargets[cnameKey]; ok && first != ep.Targets[0] {
-				log.Warnf("Only one CNAME per name — %s CNAME %s and %s CNAME %s is invalid DNS. A resolver wouldn't know which canonical name to follow.", ep.DNSName, first, ep.DNSName, ep.Targets[0])
+			// TODO: add metric for CNAME/DNAME conflicts
+			if first, ok := singleTargets[singleKey]; ok && first != ep.Targets[0] {
+				log.Warnf("Only one %[1]s per name — %[2]s %[1]s %[3]s and %[2]s %[1]s %[4]s is invalid DNS. A resolver wouldn't know which canonical name to follow.", ep.RecordType, ep.DNSName, first, ep.Targets[0])
 			}
-			cnameTargets[cnameKey] = ep.Targets[0]
+			singleTargets[singleKey] = ep.Targets[0]
 		}
 		if existing, ok := endpointMap[key]; ok {
 			existing.Targets = append(existing.Targets, ep.Targets...)

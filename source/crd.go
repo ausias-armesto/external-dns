@@ -22,7 +22,7 @@ import (
 	"strings"
 
 	log "github.com/sirupsen/logrus"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/rest"
@@ -32,6 +32,7 @@ import (
 	apiv1alpha1 "sigs.k8s.io/external-dns/apis/v1alpha1"
 	"sigs.k8s.io/external-dns/endpoint"
 	"sigs.k8s.io/external-dns/pkg/events"
+	"sigs.k8s.io/external-dns/source/annotations"
 	"sigs.k8s.io/external-dns/source/informers"
 	"sigs.k8s.io/external-dns/source/types"
 )
@@ -44,26 +45,27 @@ import (
 // +externaldns:source:description=Creates DNS entries from DNSEndpoint CRD resources
 // +externaldns:source:resources=DNSEndpoint.externaldns.k8s.io
 // +externaldns:source:filters=annotation,label
-// +externaldns:source:namespace=all,single
+// +externaldns:source:namespace=all,single,multiple
 // +externaldns:source:fqdn-template=false
 // +externaldns:source:events=true
 // +externaldns:source:provider-specific=true
 type crdSource struct {
-	crReader client.Reader
-	crWriter client.Client // status writes
-	informer crcache.Informer
-	listOpts []client.ListOption
+	crReader         client.Reader
+	crWriter         client.Client // status writes
+	informer         crcache.Informer
+	listOpts         []client.ListOption
+	annotationFilter labels.Selector
 }
 
 // NewCRDSource creates a new crdSource backed by a controller-runtime cache.
 // It builds the scheme, cache, and status-write client from restConfig and cfg.
 func NewCRDSource(ctx context.Context, restConfig *rest.Config, cfg *Config) (Source, error) {
-	opts, err := buildCacheOptions(cfg.Namespace, cfg.LabelFilter, cfg.AnnotationFilter)
+	opts, err := buildCacheOptions(cfg.Namespaces, cfg.LabelFilter)
 	if err != nil {
 		return nil, err
 	}
 
-	c, err := crcache.New(restConfig, opts)
+	crReader, err := crcache.New(restConfig, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -74,7 +76,7 @@ func NewCRDSource(ctx context.Context, restConfig *rest.Config, cfg *Config) (So
 		return nil, err
 	}
 
-	return newCrdSource(ctx, c, crWriter, cfg.Namespace, cfg.LabelFilter)
+	return newCrdSource(ctx, crReader, crWriter, cfg.Namespaces, cfg.LabelFilter, cfg.AnnotationFilter)
 }
 
 func (cs *crdSource) AddEventHandler(_ context.Context, handler func()) {
@@ -84,18 +86,23 @@ func (cs *crdSource) AddEventHandler(_ context.Context, handler func()) {
 	_, _ = cs.informer.AddEventHandler(eventHandlerFunc(handler))
 }
 
-// Endpoints returns endpoint objects for all DNSEndpoint resources visible to
-// this source. Namespace, label, and annotation filtering are handled at the
-// cache level via buildCacheOptions; target-format validation is applied here.
+// Endpoints returns endpoint objects for all DNSEndpoint resources visible to this
+// source. The cache scopes namespace and labels;
+// annotation filtering and target-format validation happen here.
 func (cs *crdSource) Endpoints(ctx context.Context) ([]*endpoint.Endpoint, error) {
 	list := &apiv1alpha1.DNSEndpointList{}
 	if err := cs.crReader.List(ctx, list, cs.listOpts...); err != nil {
 		return nil, err
 	}
 
-	endpoints := make([]*endpoint.Endpoint, 0, len(list.Items))
+	items := make([]*apiv1alpha1.DNSEndpoint, 0, len(list.Items))
 	for i := range list.Items {
-		dnsEndpoint := &list.Items[i]
+		items = append(items, &list.Items[i])
+	}
+	filtered := annotations.Filter(items, cs.annotationFilter)
+
+	endpoints := make([]*endpoint.Endpoint, 0, len(filtered))
+	for _, dnsEndpoint := range filtered {
 		var crdEndpoints []*endpoint.Endpoint
 		for _, ep := range dnsEndpoint.Spec.Endpoints {
 			if ep == nil {
@@ -111,12 +118,20 @@ func (cs *crdSource) Endpoints(ctx context.Context) ([]*endpoint.Endpoint, error
 				log.Debugf("Endpoint %s with DNSName %s has an empty list of targets, allowing it to pass through for default-targets processing", dnsEndpoint.Name, ep.DNSName)
 			}
 			illegalTarget := false
-			for _, target := range ep.Targets {
+			for key, target := range ep.Targets {
+				// CNAME/DNAME targets are domain names where a trailing dot is
+				// valid (RFC 1035 §5.1 absolute FQDN), so accept both dotted and
+				// bare forms.
+				if endpoint.RequiresTrailingDot(ep.RecordType) {
+					continue
+				}
 				switch ep.RecordType {
-				case endpoint.RecordTypeTXT, endpoint.RecordTypeMX:
+				case endpoint.RecordTypeTXT:
 					continue // no format constraint on targets
-				case endpoint.RecordTypeCNAME:
-					continue // RFC 1035 §5.1: trailing dot denotes an absolute FQDN in zone file notation; both forms are valid
+				case endpoint.RecordTypeMX:
+					// normalized, else it diffs against the provider's rendering
+					ep.Targets[key] = endpoint.NormalizeMXTarget(target)
+					continue
 				case endpoint.RecordTypeSRV:
 					// SRV targets are "<prio> <weight> <port> <host>"; RFC 2782
 					// requires the host to be an absolute FQDN and
@@ -176,8 +191,8 @@ func newCrdSource(
 	ctx context.Context,
 	c crcache.Cache,
 	crWriter client.Client,
-	namespace string,
-	labelSelector labels.Selector) (*crdSource, error) {
+	namespaces []string,
+	labelSelector, annotationFilter labels.Selector) (*crdSource, error) {
 	inf, err := c.GetInformer(ctx, &apiv1alpha1.DNSEndpoint{})
 	if err != nil {
 		return nil, err
@@ -185,16 +200,22 @@ func newCrdSource(
 
 	_, _ = inf.AddEventHandler(informers.DefaultEventHandler())
 
-	listOpts := []client.ListOption{client.InNamespace(namespace)}
+	// The cache is already scoped to the watched namespaces, so the list is restricted
+	// further only when a single one is watched, as it was before multi-namespace support.
+	var listOpts []client.ListOption
+	if len(namespaces) == 1 {
+		listOpts = append(listOpts, client.InNamespace(namespaces[0]))
+	}
 	if labelSelector != nil && !labelSelector.Empty() {
 		listOpts = append(listOpts, client.MatchingLabelsSelector{Selector: labelSelector})
 	}
 
 	cs := &crdSource{
-		crReader: c,
-		crWriter: crWriter,
-		informer: inf,
-		listOpts: listOpts,
+		crReader:         c,
+		crWriter:         crWriter,
+		informer:         inf,
+		listOpts:         listOpts,
+		annotationFilter: annotationFilter,
 	}
 
 	if err := startAndSync(ctx, c); err != nil {
@@ -223,28 +244,30 @@ func startAndSync(ctx context.Context, c crcache.Cache) error {
 	return nil
 }
 
-// buildCacheOptions constructs the controller-runtime cache options for the
-// given namespace and label selector. Extracted so the namespace/label scoping
-// logic can be unit-tested without a running API server.
-func buildCacheOptions(namespace string, labelFilter, annotationSelector labels.Selector) (crcache.Options, error) {
+// buildCacheOptions constructs the controller-runtime cache options for the given
+// namespaces and label selector. Extracted so the namespace/label scoping logic can be
+// unit-tested without a running API server.
+//
+// No annotation filter here: dropping an object from the transform empties the whole
+// cache since client-go 1.36 (#6728). crdSource.Endpoints filters instead.
+func buildCacheOptions(namespaces []string, labelFilter labels.Selector) (crcache.Options, error) {
 	scheme := runtime.NewScheme()
 	if err := apiv1alpha1.AddToScheme(scheme); err != nil {
 		return crcache.Options{}, err
 	}
-	// metav1.AddToGroupVersion registers ListOptions (and other meta types) under
-	// apiv1alpha1.GroupVersion so that runtime.NewParameterCodec can encode them
-	// as URL parameters when building watch requests for this group.
-	metav1.AddToGroupVersion(scheme, apiv1alpha1.GroupVersion)
 
-	nsMap := map[string]crcache.Config{
-		namespace: {}, // "" == NamespaceAll
+	if len(namespaces) == 0 {
+		namespaces = []string{v1.NamespaceAll}
+	}
+	nsMap := make(map[string]crcache.Config, len(namespaces))
+	for _, namespace := range namespaces {
+		nsMap[namespace] = crcache.Config{} // "" == NamespaceAll
 	}
 	byObj := crcache.ByObject{
 		Namespaces: nsMap,
 		Transform: informers.TransformerWithOptions[*apiv1alpha1.DNSEndpoint](
 			informers.TransformRemoveManagedFields(),
 			informers.TransformRemoveLastAppliedConfig(),
-			informers.TransformRequireAnnotation(annotationSelector),
 		),
 	}
 	if labelFilter != nil && !labelFilter.Empty() {

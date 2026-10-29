@@ -31,16 +31,15 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrlruntime "sigs.k8s.io/controller-runtime/pkg/client"
 
+	"sigs.k8s.io/external-dns/endpoint"
 	"sigs.k8s.io/external-dns/internal/sets"
 )
 
 func TestNewObjectReference_DoesNotMutateObject(t *testing.T) {
 	// Verify that NewObjectReference does NOT mutate the original object
 	pod := &apiv1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "test-pod",
-			Namespace: "default",
-		},
+		Name:      "test-pod",
+		Namespace: "default",
 	}
 	podCopy := pod.DeepCopy()
 
@@ -90,8 +89,8 @@ func TestObjectReference_Description(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		ref := ObjectReference{kind: tt.kind, namespace: tt.namespace, name: tt.name}
-		require.Equal(t, tt.expected, ref.description())
+		ref := endpoint.NewObjectRef(tt.kind, "", tt.namespace, tt.name, "", "")
+		require.Equal(t, tt.expected, description(ref))
 	}
 }
 
@@ -111,14 +110,10 @@ func TestEvent_NewEvents(t *testing.T) {
 		{
 			name: "event without uuid",
 			event: NewEvent(NewObjectReference(&apiv1.Pod{
-				TypeMeta: metav1.TypeMeta{
-					Kind:       "Pod",
-					APIVersion: "apiv1",
-				},
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "fake-pod",
-					Namespace: apiv1.NamespaceDefault,
-				},
+				Kind:       "Pod",
+				APIVersion: "apiv1",
+				Name:       "fake-pod",
+				Namespace:  apiv1.NamespaceDefault,
 			}, "fake"), "", ActionCreate, RecordReady),
 			asserts: func(evs []*eventsv1.Event) {
 				require.Len(t, evs, 1)
@@ -134,15 +129,11 @@ func TestEvent_NewEvents(t *testing.T) {
 		{
 			name: "event with uuid",
 			event: NewEvent(NewObjectReference(&apiv1.Pod{
-				TypeMeta: metav1.TypeMeta{
-					Kind:       "Pod",
-					APIVersion: "apiv1",
-				},
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "fake-pod",
-					Namespace: apiv1.NamespaceDefault,
-					UID:       "9de3fc19-8aeb-4e76-865d-ada955403103",
-				},
+				Kind:       "Pod",
+				APIVersion: "apiv1",
+				Name:       "fake-pod",
+				Namespace:  apiv1.NamespaceDefault,
+				UID:        "9de3fc19-8aeb-4e76-865d-ada955403103",
 			}, "fake"), "", ActionCreate, RecordReady),
 			asserts: func(evs []*eventsv1.Event) {
 				require.Len(t, evs, 1)
@@ -161,16 +152,12 @@ func TestEvent_NewEvents(t *testing.T) {
 }
 
 func TestEvent_Transpose(t *testing.T) {
-	ev := NewEvent(&ObjectReference{
-		kind:      "Pod",
-		namespace: "default",
-		name:      "nginx",
-	}, "test message", ActionCreate, RecordReady)
+	ev := NewEvent(endpoint.NewObjectRef("Pod", "", "default", "nginx", "", ""), "test message", ActionCreate, RecordReady)
 
 	evs := ev.events()
 	require.Len(t, evs, 1)
 	event := evs[0]
-	require.Contains(t, event.ObjectMeta.Name, ev.refs[0].name)
+	require.Contains(t, event.ObjectMeta.Name, ev.refs[0].Name())
 	require.Equal(t, "default", event.ObjectMeta.Namespace)
 	require.Equal(t, string(ActionCreate), event.Action)
 	require.Equal(t, string(RecordReady), event.Reason)
@@ -185,7 +172,7 @@ func TestEvent_Transpose(t *testing.T) {
 	require.Len(t, evs, 1)
 	require.Equal(t, longMsg[:1021]+"...", evs[0].Note)
 
-	ev.refs[0].name = ""
+	ev.refs[0] = *endpoint.NewObjectRef("Pod", "", "default", "", "", "")
 	require.Empty(t, ev.events())
 }
 
@@ -194,9 +181,7 @@ func TestEvent_NameAndEventTimeConsistent(t *testing.T) {
 		now := time.Now() // deterministic bubble time: 2000-01-01 00:00:00 UTC
 		expectedSuffix := fmt.Sprintf(".%x", now.UnixNano())
 
-		ev := NewEvent(&ObjectReference{
-			kind: "Pod", namespace: "default", name: "nginx",
-		}, "msg", ActionCreate, RecordReady)
+		ev := NewEvent(endpoint.NewObjectRef("Pod", "", "default", "nginx", "", ""), "msg", ActionCreate, RecordReady)
 
 		evs := ev.events()
 		require.Len(t, evs, 1)
@@ -218,10 +203,10 @@ func TestWithEmitEvents(t *testing.T) {
 	}{
 		{
 			name:     "valid events",
-			input:    []string{string(RecordReady), string(RecordError)},
-			expected: sets.New(RecordReady, RecordError),
+			input:    []string{string(RecordReady), string(RecordDeleted), string(RecordError)},
+			expected: sets.New(RecordReady, RecordDeleted, RecordError),
 			assert: func(c *Config) {
-				require.Equal(t, sets.New(RecordReady, RecordError), c.emitEvents)
+				require.Equal(t, sets.New(RecordReady, RecordDeleted, RecordError), c.emitEvents)
 				require.True(t, c.IsEnabled())
 			},
 		},
@@ -322,12 +307,7 @@ func TestNewEventFromEndpoint(t *testing.T) {
 				recordTTL:  300,
 				targets:    []string{"10.0.0.1", "10.0.0.2"},
 				owner:      "my-owner",
-				refObjects: []*ObjectReference{{
-					kind:      "Service",
-					namespace: "default",
-					name:      "my-service",
-					source:    "service",
-				}},
+				refObjects: []*ObjectReference{endpoint.NewObjectRef("Service", "", "default", "my-service", "", "service")},
 			},
 			action: ActionCreate,
 			reason: RecordReady,
@@ -336,9 +316,9 @@ func TestNewEventFromEndpoint(t *testing.T) {
 				require.Equal(t, RecordReady, ev.reason)
 				require.Equal(t, EventTypeNormal, ev.eType)
 				require.Len(t, ev.refs, 1)
-				require.Equal(t, "Service", ev.refs[0].kind)
-				require.Equal(t, "default", ev.refs[0].namespace)
-				require.Equal(t, "my-service", ev.refs[0].name)
+				require.Equal(t, "Service", ev.refs[0].Kind())
+				require.Equal(t, "default", ev.refs[0].Namespace())
+				require.Equal(t, "my-service", ev.refs[0].Name())
 				require.Contains(t, ev.message, "record:test.example.com")
 				require.Contains(t, ev.message, "owner:my-owner")
 				require.Contains(t, ev.message, "type:A")
@@ -355,12 +335,7 @@ func TestNewEventFromEndpoint(t *testing.T) {
 				recordTTL:  0,
 				targets:    []string{"target.example.com"},
 				owner:      "",
-				refObjects: []*ObjectReference{{
-					kind:      "Ingress",
-					namespace: "prod",
-					name:      "my-ingress",
-					source:    "ingress",
-				}},
+				refObjects: []*ObjectReference{endpoint.NewObjectRef("Ingress", "", "prod", "my-ingress", "", "ingress")},
 			},
 			action: ActionDelete,
 			reason: RecordDeleted,
@@ -380,18 +355,13 @@ func TestNewEventFromEndpoint(t *testing.T) {
 				recordTTL:  60,
 				targets:    []string{"192.168.1.1"},
 				owner:      "default",
-				refObjects: []*ObjectReference{{
-					kind:      "Node",
-					namespace: "", // cluster-scoped
-					name:      "node1",
-					source:    "node",
-				}},
+				refObjects: []*ObjectReference{endpoint.NewObjectRef("Node", "", "", "node1", "", "node")},
 			},
 			action: ActionCreate,
 			reason: RecordReady,
 			asserts: func(t *testing.T, ev Event) {
 				require.Equal(t, ActionCreate, ev.action)
-				require.Empty(t, ev.refs[0].namespace)
+				require.Empty(t, ev.refs[0].Namespace())
 
 				evs := ev.events()
 				require.Len(t, evs, 1)
@@ -407,8 +377,8 @@ func TestNewEventFromEndpoint(t *testing.T) {
 				targets:    []string{"1.2.3.4"},
 				owner:      "owner",
 				refObjects: []*ObjectReference{
-					{kind: "DNSEndpoint", namespace: "default", name: "shared-dns", source: "crd"},
-					{kind: "Service", namespace: "default", name: "shared-svc", source: "service"},
+					endpoint.NewObjectRef("DNSEndpoint", "", "default", "shared-dns", "", "crd"),
+					endpoint.NewObjectRef("Service", "", "default", "shared-svc", "", "service"),
 				},
 			},
 			action: ActionCreate,
@@ -441,112 +411,65 @@ func TestNewObjectReference(t *testing.T) {
 		{
 			name: "Pod with TypeMeta already set",
 			obj: &apiv1.Pod{
-				TypeMeta: metav1.TypeMeta{
-					Kind:       "Pod",
-					APIVersion: "v1",
-				},
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "my-pod",
-					Namespace: "default",
-					UID:       "pod-uid-123",
-				},
+				Kind:       "Pod",
+				APIVersion: "v1",
+				Name:       "my-pod",
+				Namespace:  "default",
+				UID:        "pod-uid-123",
 			},
-			source: "pod",
-			expected: &ObjectReference{
-				kind:       "Pod",
-				apiVersion: "v1",
-				namespace:  "default",
-				name:       "my-pod",
-				uid:        "pod-uid-123",
-				source:     "pod",
-			},
+			source:   "pod",
+			expected: endpoint.NewObjectRef("Pod", "v1", "default", "my-pod", "pod-uid-123", "pod"),
 		},
 		{
 			name: "Pod without TypeMeta (simulating informer behavior)",
 			obj: &apiv1.Pod{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "informer-pod",
-					Namespace: "kube-system",
-					UID:       "informer-uid-456",
-				},
+				Name:      "informer-pod",
+				Namespace: "kube-system",
+				UID:       "informer-uid-456",
 			},
-			source: "pod",
-			expected: &ObjectReference{
-				kind:       "Pod",
-				apiVersion: "v1",
-				namespace:  "kube-system",
-				name:       "informer-pod",
-				uid:        "informer-uid-456",
-				source:     "pod",
-			},
+			source:   "pod",
+			expected: endpoint.NewObjectRef("Pod", "v1", "kube-system", "informer-pod", "informer-uid-456", "pod"),
 		},
 		{
 			name: "Service without TypeMeta",
 			obj: &apiv1.Service{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "my-service",
-					Namespace: "prod",
-					UID:       "svc-uid-789",
-				},
+				Name:      "my-service",
+				Namespace: "prod",
+				UID:       "svc-uid-789",
 			},
-			source: "service",
-			expected: &ObjectReference{
-				kind:       "Service",
-				apiVersion: "v1",
-				namespace:  "prod",
-				name:       "my-service",
-				uid:        "svc-uid-789",
-				source:     "service",
-			},
+			source:   "service",
+			expected: endpoint.NewObjectRef("Service", "v1", "prod", "my-service", "svc-uid-789", "service"),
 		},
 		{
 			name: "Node (cluster-scoped, no namespace)",
 			obj: &apiv1.Node{
-				ObjectMeta: metav1.ObjectMeta{
-					Name: "worker-node-1",
-					UID:  "node-uid-abc",
-				},
+				Name: "worker-node-1",
+				UID:  "node-uid-abc",
 			},
-			source: "node",
-			expected: &ObjectReference{
-				kind:       "Node",
-				apiVersion: "v1",
-				namespace:  "",
-				name:       "worker-node-1",
-				uid:        "node-uid-abc",
-				source:     "node",
-			},
+			source:   "node",
+			expected: endpoint.NewObjectRef("Node", "v1", "", "worker-node-1", "node-uid-abc", "node"),
 		},
 		{
 			name: "Endpoints without TypeMeta",
 			obj: &apiv1.Endpoints{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "my-endpoints",
-					Namespace: "default",
-					UID:       "ep-uid-def",
-				},
+				Name:      "my-endpoints",
+				Namespace: "default",
+				UID:       "ep-uid-def",
 			},
-			source: "endpoints",
-			expected: &ObjectReference{
-				kind:       "Endpoints",
-				apiVersion: "v1",
-				namespace:  "default",
-				name:       "my-endpoints",
-				uid:        "ep-uid-def",
-				source:     "endpoints",
-			},
+			source:   "endpoints",
+			expected: endpoint.NewObjectRef("Endpoints", "v1", "default", "my-endpoints", "ep-uid-def", "endpoints"),
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			result := NewObjectReference(tt.obj, tt.source)
-			require.Equal(t, tt.expected.kind, result.kind)
-			require.Equal(t, tt.expected.apiVersion, result.apiVersion)
-			require.Equal(t, tt.expected.namespace, result.namespace)
-			require.Equal(t, tt.expected.name, result.name)
-			require.Equal(t, tt.expected.uid, result.uid)
-			require.Equal(t, tt.expected.source, result.source)
+			require.Equal(t, tt.expected.Kind(), result.Kind())
+			require.Equal(t, tt.expected.APIVersion(), result.APIVersion())
+			require.Equal(t, tt.expected.Namespace(), result.Namespace())
+			require.Equal(t, tt.expected.Name(), result.Name())
+			require.Equal(t, tt.expected.UID(), result.UID())
+			require.Equal(t, tt.expected.Source(), result.Source())
 		})
 	}
 }
@@ -565,7 +488,7 @@ func (c *customObject) DeepCopyObject() runtime.Object {
 }
 
 func TestEvent_Accessors(t *testing.T) {
-	ref := &ObjectReference{kind: "Pod", namespace: "default", name: "nginx"}
+	ref := endpoint.NewObjectRef("Pod", "", "default", "nginx", "", "")
 	ev := NewEvent(ref, "msg", ActionDelete, RecordDeleted)
 
 	assert.Equal(t, ActionDelete, ev.Action())
@@ -581,17 +504,17 @@ func TestObjectReference_Key(t *testing.T) {
 	}{
 		{
 			name:     "namespaced resource",
-			ref:      &ObjectReference{source: "service", namespace: "default", name: "svc"},
+			ref:      endpoint.NewObjectRef("", "", "default", "svc", "", "service"),
 			expected: "service/default/svc",
 		},
 		{
 			name:     "cluster-scoped resource has empty namespace segment",
-			ref:      &ObjectReference{source: "node", namespace: "", name: "node-1"},
+			ref:      endpoint.NewObjectRef("", "", "", "node-1", "", "node"),
 			expected: "node//node-1",
 		},
 		{
 			name:     "different sources with same namespace and name produce distinct keys",
-			ref:      &ObjectReference{source: "crd", namespace: "default", name: "my-dns"},
+			ref:      endpoint.NewObjectRef("", "", "default", "my-dns", "", "crd"),
 			expected: "crd/default/my-dns",
 		},
 	}
@@ -613,21 +536,19 @@ func TestWithDryRun(t *testing.T) {
 func TestNewObjectReference_ReflectionFallback(t *testing.T) {
 	// Test that when object type is not in scheme, reflection is used to get Kind
 	obj := &customObject{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "custom-resource",
-			Namespace: "custom-ns",
-			UID:       "custom-uid-123",
-		},
+		Name:      "custom-resource",
+		Namespace: "custom-ns",
+		UID:       "custom-uid-123",
 	}
 
 	ref := NewObjectReference(obj, "custom")
 
 	// Kind should be derived from reflection (struct name)
-	require.Equal(t, "customObject", ref.kind)
+	require.Equal(t, "customObject", ref.Kind())
 	// APIVersion will be empty since it's not in scheme
-	require.Empty(t, ref.apiVersion)
-	require.Equal(t, "custom-ns", ref.namespace)
-	require.Equal(t, "custom-resource", ref.name)
-	require.Equal(t, "custom-uid-123", string(ref.uid))
-	require.Equal(t, "custom", ref.source)
+	require.Empty(t, ref.APIVersion())
+	require.Equal(t, "custom-ns", ref.Namespace())
+	require.Equal(t, "custom-resource", ref.Name())
+	require.Equal(t, "custom-uid-123", string(ref.UID()))
+	require.Equal(t, "custom", ref.Source())
 }

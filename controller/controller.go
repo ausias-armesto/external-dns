@@ -55,6 +55,8 @@ type Controller struct {
 	// The lastRunAt used for throttling and batching reconciliation
 	lastRunAt    time.Time
 	EventEmitter events.EventEmitter
+	// StatusReporter is nil unless the crd source is enabled.
+	StatusReporter StatusReporter
 	// MangedRecordTypes are DNS record types that will be considered for management.
 	ManagedRecordTypes []string
 	// ExcludeRecordTypes are DNS record types that will be excluded from management.
@@ -63,6 +65,8 @@ type Controller struct {
 	MinEventSyncInterval time.Duration
 	// Old txt-owner value we need to migrate from
 	TXTOwnerOld string
+	// CRDSourceKind is the Kind reported for "crd/" deletes.
+	CRDSourceKind string
 }
 
 // RunOnce runs a single iteration of a reconciliation loop.
@@ -122,14 +126,18 @@ func (c *Controller) RunOnce(ctx context.Context) error {
 		if err != nil {
 			registryErrorsTotal.Counter.Inc()
 			deprecatedRegistryErrors.Counter.Inc()
-			emitChangeEvent(c.EventEmitter, plan.Changes, events.RecordError)
+			emitChangeEvent(c.EventEmitter, plan.Changes, events.RecordError, c.CRDSourceKind)
+			reportSyncStatus(ctx, c.StatusReporter, plan, err)
 			return err
 		}
-		emitChangeEvent(c.EventEmitter, plan.Changes, events.RecordReady)
+		emitChangeEvent(c.EventEmitter, plan.Changes, events.RecordReady, c.CRDSourceKind)
 	} else {
 		controllerNoChangesTotal.Counter.Inc()
 		log.Info("All records are already up to date")
 	}
+
+	// Also when nothing changed: in-sync objects still need a status.
+	reportSyncStatus(ctx, c.StatusReporter, plan, nil)
 
 	lastSyncTimestamp.Gauge.SetToCurrentTime()
 

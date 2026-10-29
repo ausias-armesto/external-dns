@@ -2,7 +2,7 @@
 
 <!-- markdownlint-disable MD060 -->
 
-![Version: 1.21.1](https://img.shields.io/badge/Version-1.21.1-informational?style=flat-square) ![Type: application](https://img.shields.io/badge/Type-application-informational?style=flat-square) ![AppVersion: 0.21.0](https://img.shields.io/badge/AppVersion-0.21.0-informational?style=flat-square)
+![Version: 1.23.0](https://img.shields.io/badge/Version-1.23.0-informational?style=flat-square) ![Type: application](https://img.shields.io/badge/Type-application-informational?style=flat-square) ![AppVersion: 0.23.0](https://img.shields.io/badge/AppVersion-0.23.0-informational?style=flat-square)
 
 ExternalDNS synchronizes exposed Kubernetes Services and Ingresses with DNS providers.
 
@@ -29,7 +29,7 @@ helm repo add external-dns https://kubernetes-sigs.github.io/external-dns/
 After you've installed the repo you can install the chart.
 
 ```shell
-helm upgrade --install external-dns external-dns/external-dns --version 1.21.1
+helm upgrade --install external-dns external-dns/external-dns --version 1.23.0
 ```
 
 ## Providers
@@ -107,6 +107,7 @@ If `namespaced` is set to `true`, please ensure that `sources` only contains sup
 | enableGatewayListenerSets | bool | `false` | if `true`, the Gateway API ListenerSet flag will be enabled. |
 | enabled | bool | `nil` | No effect - reserved for use in sub-charting. |
 | env | list | `[]` | [Environment variables](https://kubernetes.io/docs/tasks/inject-data-application/define-environment-variable-container/) for the `external-dns` container. |
+| eventsEmit | list | `[]` | _Kubernetes_ events to emit; valid values are `RecordReady`, `RecordDeleted` & `RecordError`. Setting this also grants the RBAC permission to create `events.k8s.io` events. |
 | excludeDomains | list | `[]` | Intentionally exclude domains from being managed. |
 | extraArgs | object | `{}` | Extra arguments to provide to _ExternalDNS_. An array or map can be used, with maps allowing for value overrides; maps also support slice values to use the same arg multiple times. |
 | extraContainers | list | `[]` | Extra containers to add to the `Deployment`. |
@@ -115,6 +116,7 @@ If `namespaced` is set to `true`, please ensure that `sources` only contains sup
 | fullnameOverride | string | `nil` | Override the full name of the chart. |
 | gatewayNamespace | string | `nil` | _Gateway API_ gateway namespace to watch. When `namespaced=true`, setting this value avoids creating any cluster-scoped RBAC (no ClusterRole/ClusterRoleBinding) for Gateway sources. |
 | global.imagePullSecrets | list | `[]` | Global image pull secrets. |
+| hostAliases | list | `[]` | [Host aliases](https://kubernetes.io/docs/tasks/network/customize-hosts-file-for-pods/) to add to the `Pod` definition, injected into the pod's `/etc/hosts`. |
 | image.pullPolicy | string | `"IfNotPresent"` | Image pull policy for the `external-dns` container. |
 | image.repository | string | `"registry.k8s.io/external-dns/external-dns"` | Image repository for the `external-dns` container. |
 | image.tag | string | `nil` | Image tag for the `external-dns` container, this will default to `.Chart.AppVersion` if not set. |
@@ -145,13 +147,13 @@ If `namespaced` is set to `true`, please ensure that `sources` only contains sup
 | provider.webhook.livenessProbe | object | See _values.yaml_ | [Liveness probe](https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/) configuration for the `external-dns` container. |
 | provider.webhook.readinessProbe | object | See _values.yaml_ | [Readiness probe](https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/) configuration for the `webhook` container. |
 | provider.webhook.resources | object | `{}` | [Resources](https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/) for the `webhook` container. |
-| provider.webhook.securityContext | object | See _values.yaml_ | [Pod security context](https://kubernetes.io/docs/tasks/configure-pod-container/security-context/#set-the-security-context-for-a-container) for the `webhook` container. |
+| provider.webhook.securityContext | object | See _values.yaml_ | [Security context](https://kubernetes.io/docs/tasks/configure-pod-container/security-context/#set-the-security-context-for-a-container) for the `webhook` container. |
 | provider.webhook.service.port | int | `8080` | Webhook exposed HTTP port for the service. |
 | provider.webhook.serviceMonitor | object | See _values.yaml_ | Optional [Service Monitor](https://prometheus-operator.dev/docs/operator/design/#servicemonitor) configuration for the `webhook` container. |
 | rbac.additionalPermissions | list | `[]` | Additional rules to add to the `ClusterRole`. |
 | rbac.create | bool | `true` | If `true`, create a `ClusterRole` & `ClusterRoleBinding` with access to the Kubernetes API. |
 | readinessProbe | object | See _values.yaml_ | [Readiness probe](https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/) configuration for the `external-dns` container. |
-| registry | string | `"txt"` | Specify the registry for storing ownership and labels. Valid values are `txt`, `aws-sd`, `dynamodb` & `noop`. |
+| registry | string | `"txt"` | Specify the registry for storing ownership and labels. Valid values are `txt`, `aws-sd`, `crd`, `dynamodb` & `noop`. |
 | replicaCount | int | `1` | Number of replicas of the `external-dns` `Deployment`. external-dns does not support leader election, so this must be `0` or `1` to avoid duplicate or conflicting DNS record updates. Set to `0` to scale the `Deployment` down. |
 | resources | object | `{}` | [Resources](https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/) for the `external-dns` container. |
 | revisionHistoryLimit | int | `nil` | Specify the number of old `ReplicaSets` to retain to allow rollback of the `Deployment``. |

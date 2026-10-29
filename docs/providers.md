@@ -13,11 +13,9 @@ Provider supported configurations
 | CoreDNS       | n/a        | yes     | n/a                   |
 | DNSSimple     | n/a        | yes     | 3600                  |
 | Exoscale      | n/a        | yes     | n/a                   |
-| Gandi         | n/a        | no      | 600                   |
 | GoDaddy       | n/a        | yes     | 600                   |
 | Google GCP    | n/a        | yes     | 300                   |
 | InMemory      | n/a        | n/a     | n/a                   |
-| Linode        | n/a        | n/a     | n/a                   |
 | Myra Security | n/a        | yes     | 300                   |
 | NS1           | n/a        | yes     | 10                    |
 | OCI           | yes        | yes     | 300                   |

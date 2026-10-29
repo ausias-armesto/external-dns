@@ -42,10 +42,10 @@ import (
 // +externaldns:source:description=Creates DNS entries based on Kubernetes Node resources
 // +externaldns:source:resources=Node
 // +externaldns:source:filters=annotation,label
-// +externaldns:source:namespace=all
 // +externaldns:source:fqdn-template=true
 // +externaldns:source:provider-specific=false
 // +externaldns:source:events=true
+// +externaldns:source:validation=annotation
 type nodeSource struct {
 	client         kubernetes.Interface
 	templateEngine template.Engine
@@ -68,6 +68,7 @@ func NewNodeSource(
 	informers.MustAddIndexers(nodeInformer.Informer(), informers.IndexerWithOptions[*v1.Node](
 		informers.IndexSelectorWithAnnotationFilter(cfg.AnnotationFilter),
 		informers.IndexSelectorWithLabelSelector(cfg.LabelFilter),
+		informers.IndexSelectorWithAnnotationValidation(cfg.Schema.WithSource(types.Node)),
 		informers.IndexSelectorWithConditions(annotations.IsControllerMatch[*v1.Node]),
 	))
 
@@ -183,6 +184,9 @@ func (ns *nodeSource) endpointsForDNSNames(node *v1.Node, dnsNames []string) ([]
 
 		for _, addr := range addrs {
 			ep := endpoint.NewEndpointWithTTL(dns, endpoint.SuitableType(addr), ttl, addr)
+			if ep == nil {
+				continue
+			}
 			ep.WithLabel(endpoint.ResourceLabelKey, fmt.Sprintf("node/%s", node.Name))
 			log.Debugf("adding endpoint %s target %s", ep, addr)
 			endpoints = append(endpoints, ep)

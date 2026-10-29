@@ -466,13 +466,13 @@ func TestKongTCPIngressEndpoints(t *testing.T) {
 			tcpi := unstructured.Unstructured{}
 
 			tcpIngressAsJSON, err := json.Marshal(ti.tcpProxy)
-			assert.NoError(t, err)
+			require.NoError(t, err)
 
-			assert.NoError(t, tcpi.UnmarshalJSON(tcpIngressAsJSON))
+			require.NoError(t, tcpi.UnmarshalJSON(tcpIngressAsJSON))
 
 			// Create proxy resources
 			_, err = fakeDynamicClient.Resource(kongGroupdVersionResource).Namespace(defaultKongNamespace).Create(t.Context(), &tcpi, metav1.CreateOptions{})
-			assert.NoError(t, err)
+			require.NoError(t, err)
 
 			labelFilter := ti.labelFilter
 			if labelFilter == nil {
@@ -480,13 +480,13 @@ func TestKongTCPIngressEndpoints(t *testing.T) {
 			}
 			source, err := NewKongTCPIngressSource(t.Context(), fakeDynamicClient, fakeKubernetesClient,
 				&Config{
-					Namespace:                defaultKongNamespace,
+					Namespaces:               []string{defaultKongNamespace},
 					AnnotationFilter:         parseAnnotationFilterOrNil("kubernetes.io/ingress.class=kong"),
 					IgnoreHostnameAnnotation: ti.ignoreHostnameAnnotation,
 					LabelFilter:              labelFilter,
 				})
-			assert.NoError(t, err)
-			assert.NotNil(t, source)
+			require.NoError(t, err)
+			require.NotNil(t, source)
 
 			count := &unstructured.UnstructuredList{}
 			for len(count.Items) < 1 {
@@ -494,7 +494,7 @@ func TestKongTCPIngressEndpoints(t *testing.T) {
 			}
 
 			endpoints, err := source.Endpoints(t.Context())
-			assert.NoError(t, err)
+			require.NoError(t, err)
 			testutils.ValidateEndpoints(t, endpoints, ti.expected)
 		})
 	}
@@ -516,7 +516,7 @@ func TestKongTCPIngressSource_InformerTransform(t *testing.T) {
 	testDynamicInformerTransformHelper(t,
 		kongGroupdVersionResource,
 		fakeDynamicClient,
-		source.(*kongTCPIngressSource).kongTCPIngressInformer,
+		informerFor(t, source.(*kongTCPIngressSource).kongTCPIngressInformers, ""),
 		withRemovedLastAppliedConfigAnnotation(),
 		withRemovedManagedFields(),
 	)
@@ -536,16 +536,12 @@ func TestKongTCPIngressIndexer(t *testing.T) {
 			lbls = map[string]string{}
 		}
 		return &TCPIngress{
-			TypeMeta: metav1.TypeMeta{
-				APIVersion: kongGroupdVersionResource.GroupVersion().String(),
-				Kind:       "TCPIngress",
-			},
-			ObjectMeta: metav1.ObjectMeta{
-				Name:        name,
-				Namespace:   defaultKongNamespace,
-				Annotations: ann,
-				Labels:      lbls,
-			},
+			APIVersion:  kongGroupdVersionResource.GroupVersion().String(),
+			Kind:        "TCPIngress",
+			Name:        name,
+			Namespace:   defaultKongNamespace,
+			Annotations: ann,
+			Labels:      lbls,
 			Spec: tcpIngressSpec{
 				Rules: []tcpIngressRule{{Host: name + ".example.org", Port: 80}},
 			},
@@ -641,7 +637,7 @@ func TestKongTCPIngressIndexer(t *testing.T) {
 			}
 
 			src, err := NewKongTCPIngressSource(t.Context(), fakeDynamicClient, fakeKubernetesClient, &Config{
-				Namespace:        defaultKongNamespace,
+				Namespaces:       []string{defaultKongNamespace},
 				AnnotationFilter: parseAnnotationFilterOrNil(tt.annotationFilter),
 				LabelFilter:      parseLabelSelectorOrEverything(t, tt.labelFilter),
 			})
