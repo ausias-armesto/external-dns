@@ -3,23 +3,32 @@ set:
   policy: upsert-only
 templates:
   - dnsendpoint-crd.yaml
+  - dnsrecords.externaldns.k8s.io.yaml
 release:
   namespace: default
 tests:
-  - it: should install the DNSEndpoint CRD by default
+  - it: should install the DNSEndpoint and DNSRecord CRDs by default
     asserts:
       - hasDocuments:
           count: 1
-      - isKind:
-          of: CustomResourceDefinition
+        template: dnsendpoint-crd.yaml
       - equal:
           path: metadata.name
           value: dnsendpoints.externaldns.k8s.io
+        template: dnsendpoint-crd.yaml
+      - equal:
+          path: metadata.name
+          value: dnsrecords.externaldns.k8s.io
+        template: dnsrecords.externaldns.k8s.io.yaml
 
-  - it: should not install the CRD when crds.install is false
+  - it: should not install the CRDs when crds.install is false
     set:
       crds:
         install: false
     asserts:
       - hasDocuments:
           count: 0
+        template: dnsendpoint-crd.yaml
+      - hasDocuments:
+          count: 0
+        template: dnsrecords.externaldns.k8s.io.yaml
